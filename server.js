@@ -1,54 +1,45 @@
-// Server ARTX per SHARD OF SOULS — Stripe Checkout + webhook.
-// Avvio: npm install express stripe cors && STRIPE_SECRET_KEY=sk_... STRIPE_WEBHOOK_SECRET=whsec_... node server.js
-const express = require('express'), cors = require('cors'), fs = require('fs');
+// Server ARTX per SHARD OF SOULS — Stripe Checkout + codici firmati (senza webhook).
+// Variabili d'ambiente: STRIPE_SECRET_KEY, SIGN_KEY (contenuto di chiave-privata.pem), BASE_URL (opzionale)
+const express = require('express'), crypto = require('crypto');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const PACKS = [ // stessi pacchetti del gioco (indice = posizione in ARTX_PACKS)
+const SIGN_KEY = (process.env.SIGN_KEY || '').replace(/\\n/g, '\n');
+const PACKS = [
   { artx: 500,  cents: 499,  name: '500 ARTX' },
   { artx: 1500, cents: 1299, name: '1500 ARTX' },
   { artx: 4000, cents: 2999, name: '4000 ARTX' },
 ];
-const DB = './artx-db.json';
-const load = () => { try { return JSON.parse(fs.readFileSync(DB)); } catch { return {}; } };
-const save = d => fs.writeFileSync(DB, JSON.stringify(d));
 const app = express();
-app.use(cors());
+const b64 = b => Buffer.from(b).toString('base64url');
+const base = req => process.env.BASE_URL || (req.protocol + '://' + req.get('host'));
 
-// Webhook: Stripe conferma il pagamento (va PRIMA di express.json, serve il body grezzo)
-app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-  let ev;
-  try { ev = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET); }
-  catch (e) { return res.status(400).send('firma non valida'); }
-  if (ev.type === 'checkout.session.completed' && ev.data.object.payment_status === 'paid') {
-    const s = ev.data.object, db = load();
-    db.done = db.done || {};
-    if (!db.done[s.id]) { // idempotente
-      db.done[s.id] = 1;
-      const pid = s.metadata.pid, pack = PACKS[+s.metadata.pack];
-      if (pid && pack) { db.bal = db.bal || {}; db.bal[pid] = (db.bal[pid] || 0) + pack.artx; save(db); }
-    }
-  }
-  res.json({ received: true });
+// 1) Il gioco apre questa pagina: crea il pagamento e porta il giocatore su Stripe
+app.get('/buy', async (req, res) => {
+  const p = PACKS[+req.query.pack];
+  if (!p) return res.status(400).send('Pacchetto non valido');
+  try {
+    const s = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ quantity: 1, price_data: { currency: 'eur', unit_amount: p.cents, product_data: { name: p.name + ' — Shard of Souls' } } }],
+      metadata: { pack: String(req.query.pack) },
+      success_url: base(req) + '/thanks?sid={CHECKOUT_SESSION_ID}',
+      cancel_url: base(req) + '/annullato',
+    });
+    res.redirect(303, s.url);
+  } catch (e) { res.status(500).send('Errore pagamento: ' + e.message); }
 });
 
-app.use(express.json());
-// Crea la sessione di pagamento
-app.post('/checkout', async (req, res) => {
-  const { pid, pack, ret } = req.body || {};
-  const p = PACKS[pack];
-  if (!pid || !p) return res.status(400).json({ error: 'richiesta non valida' });
-  const session = await stripe.checkout.sessions.create({
-    mode: 'payment',
-    line_items: [{ quantity: 1, price_data: { currency: 'eur', unit_amount: p.cents, product_data: { name: p.name + ' — Shard of Souls' } } }],
-    metadata: { pid, pack: String(pack) },
-    success_url: ret || 'https://claude.ai', cancel_url: ret || 'https://claude.ai',
-  });
-  res.json({ url: session.url });
+// 2) Dopo il pagamento: verifica con Stripe e mostra un codice firmato da incollare nel gioco
+app.get('/thanks', async (req, res) => {
+  try {
+    const s = await stripe.checkout.sessions.retrieve(String(req.query.sid));
+    if (s.payment_status !== 'paid') return res.status(402).send('Pagamento non completato.');
+    const pack = PACKS[+s.metadata.pack];
+    const payload = b64(JSON.stringify({ id: s.id, a: pack.artx }));
+    const sig = crypto.sign('sha256', Buffer.from(payload), { key: SIGN_KEY, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+    const code = payload + '.' + sig;
+    res.send(`<!doctype html><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><body style="font-family:sans-serif;background:#07101c;color:#fff;text-align:center;padding:30px"><h2>✦ Pagamento riuscito: ${pack.artx} ARTX</h2><p>Copia questo codice e incollalo nel gioco, in Negozio → “Riscatta”.</p><textarea id=c readonly style="width:90%;max-width:520px;height:120px;font-size:12px">${code}</textarea><br><br><button onclick="c.select();navigator.clipboard&&navigator.clipboard.writeText(c.value);this.textContent='Copiato!'" style="font-size:18px;padding:10px 20px">COPIA CODICE</button></body>`);
+  } catch (e) { res.status(400).send('Sessione non valida.'); }
 });
-// Il gioco ritira gli ARTX pagati (una sola volta)
-app.get('/claim', (req, res) => {
-  const db = load(), pid = String(req.query.pid || '');
-  const n = (db.bal && db.bal[pid]) || 0;
-  if (n) { db.bal[pid] = 0; save(db); }
-  res.json({ artx: n });
-});
+app.get('/annullato', (q, r) => r.send('Pagamento annullato. Puoi chiudere questa scheda.'));
+app.get('/', (q, r) => r.send('ARTX server attivo'));
 app.listen(process.env.PORT || 3000, () => console.log('ARTX server attivo'));
